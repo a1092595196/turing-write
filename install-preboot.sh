@@ -15,17 +15,27 @@ IMG=/boot/initrd.img-$VER
 HOOK_LINE='test -x /tw_preboot && /tw_preboot 0x88888888'
 
 [ -f "$IMG" ] || { echo "错误: 找不到 $IMG"; exit 1; }
-MAGIC=$(head -c2 "$IMG" | od -An -tx1 | tr -d ' \n')
-[ "$MAGIC" = "1f8b" ] || { echo "错误: $IMG 不是 gzip (magic=$MAGIC),请先确认压缩格式"; exit 1; }
+
+# 检测压缩格式(gzip/xz/bzip2/zstd/未压缩 newc cpio)
+MAGIC4=$(head -c4 "$IMG" | od -An -tx1 | tr -d ' \n')
+case "$MAGIC4" in
+  1f8b*) DECOMP="gzip -dc";  REPACK="gzip -9"  ;;
+  fd37*) DECOMP="xz -dc";    REPACK="xz -9"    ;;
+  425a*) DECOMP="bzip2 -dc"; REPACK="bzip2 -9" ;;
+  28b5*) DECOMP="zstd -dc";  REPACK="zstd -19" ;;
+  3037*) DECOMP="cat";       REPACK="cat"      ;;  # 未压缩 newc cpio (magic 070701)
+  *) echo "错误: 无法识别 $IMG 格式 (magic=$MAGIC4)"; exit 1 ;;
+esac
+echo "检测到格式: $DECOMP"
 
 if [ "$1" = "--remove" ]; then
     TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-    zcat "$IMG" | (cd "$TMP" && cpio -idm --quiet 2>/dev/null)
+    $DECOMP "$IMG" | (cd "$TMP" && cpio -idm --quiet 2>/dev/null)
     for f in scripts/local-premount scripts/local; do
         [ -f "$TMP/$f" ] && grep -v tw_preboot "$TMP/$f" > "$TMP/$f.new" && mv "$TMP/$f.new" "$TMP/$f"
     done
     rm -f "$TMP/tw_preboot"
-    (cd "$TMP" && find . | cpio -o -H newc --quiet 2>/dev/null | gzip -9) > "$IMG.new"
+    (cd "$TMP" && find . | cpio -o -H newc --quiet 2>/dev/null | $REPACK) > "$IMG.new"
     mv "$IMG" "$IMG.bak"; mv "$IMG.new" "$IMG"
     echo "已移除钩子。原文件在 $IMG.bak"
     exit 0
@@ -34,7 +44,7 @@ fi
 [ -x ./tw_preboot ] || { echo "错误: 本目录需要 tw_preboot 静态二进制"; exit 1; }
 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-zcat "$IMG" | (cd "$TMP" && cpio -idm --quiet 2>/dev/null)
+$DECOMP "$IMG" | (cd "$TMP" && cpio -idm --quiet 2>/dev/null)
 
 cp ./tw_preboot "$TMP/tw_preboot"
 chmod 755 "$TMP/tw_preboot"

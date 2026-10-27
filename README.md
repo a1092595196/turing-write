@@ -79,6 +79,32 @@ journalctl -u nvidia-vgpud | tail -30
 | /dev/mem open/mmap 失败 | STRICT_DEVMEM 或内核配置阻止 | 看错误行;Proxmox 默认 STRICT_DEVMEM=y 但允许 PCI MMIO,若失败需确认 BAR 未被早期占用 |
 | 启动失败/黑屏 | pre-boot 写导致 GSP 起不来 | **再重启一次即恢复出厂**(寄存器每次 boot 按固件配置恢复),然后 `--remove` |
 
+## 对比实验:老 turing-unlock 全路径(GRUB 参数,不动 initramfs)
+
+如果主机上还装着 turing-unlock 的模块和固件(之前回滚时可能只去掉了内核参数),可以直接用老方式跑一次"全路径"对照实验(FLR + SEC2 fire + GSP 重启 + WPR2 修改):
+
+```bash
+# 先确认模块还在
+modinfo turing_unlock | head
+cpio -t < /boot/initrd.img-$(uname -r) | grep -i turing   # 本机 initrd 是未压缩 newc cpio,直接 cpio -t
+
+# 加内核参数(唯一 opt-in,模块没参数时什么都不做)
+grep -q 'turing_unlock.targets' /etc/default/grub || \
+  sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/"$/" turing_unlock.targets=all"/' /etc/default/grub
+grep GRUB_CMDLINE_LINUX_DEFAULT /etc/default/grub
+sudo update-grub && sudo reboot
+```
+
+重启后检查:`journalctl -k -b | grep turing_unlock`、vGPU 状态、`./bench_one`。
+回滚:把参数删掉再 update-grub + 重启即可:
+
+```bash
+sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/ turing_unlock.targets=all//' /etc/default/grub
+sudo update-grub && sudo reboot
+```
+
+注意:这是之前被怀疑破坏 vGPU 的那条重路径,本次重启实验的目的就是在 reboot 级别验证互斥结论;若 GPU 起不来,删参数重启即恢复。
+
 ## 安全性与回滚
 
 - 唯一硬件写:`BAR0+0x409664`,一次 32 位写。默认无 SBR/FLR/复位,不打断 GPU。
