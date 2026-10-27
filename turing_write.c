@@ -7,6 +7,7 @@
  *
  * 用法:
  *   make
+ *   sudo insmod turing_write.ko read_only=1   # post-boot 校验:只读,不写
  *   sudo insmod turing_write.ko               # 写 SS0=0x88888888
  *   sudo insmod turing_write.ko ss0=0         # 写别的值(如重新锁回 0)
  *   dmesg | grep turing_write
@@ -26,6 +27,11 @@ MODULE_DESCRIPTION("Minimal experiment: write SS0 (SM_SPEED_SELECT) only, no FLR
 static u32 ss0 = 0x88888888;
 module_param(ss0, uint, 0444);
 MODULE_PARM_DESC(ss0, "value to write to SS0 (BAR0+0x409664), default 0x88888888");
+
+/* 1 = 只读 PLM/SS0/SS1,不写任何寄存器(post-boot 校验用) */
+static u32 read_only;
+module_param(read_only, uint, 0444);
+MODULE_PARM_DESC(read_only, "1 = read-only dump, no hardware write (post-boot verification)");
 
 /* 只读参考寄存器 (BAR0 偏移) */
 #define REG_PLM  0x00409650u
@@ -82,17 +88,21 @@ static int __init turing_write_init(void)
     reg_dump("before", bar);
     before = readl(bar + REG_SS0);
 
-    /* —— 唯一的硬件写: SS0 —— */
-    writel(ss0, bar + REG_SS0);
-    mdelay(100);
-    after = readl(bar + REG_SS0);
+    if (read_only) {
+        pr_info("turing_write: read-only mode, 不写寄存器 (SS0 当前值见 before 行)\n");
+    } else {
+        /* —— 唯一的硬件写: SS0 —— */
+        writel(ss0, bar + REG_SS0);
+        mdelay(100);
+        after = readl(bar + REG_SS0);
 
-    reg_dump("after ", bar);
-    if (after == ss0)
-        pr_info("turing_write: SS0 write OK (0x%08x -> 0x%08x)\n", before, after);
-    else
-        pr_warn("turing_write: SS0 DROPPED (before=0x%08x wrote=0x%08x readback=0x%08x) — 写保护或 GSP 覆盖\n",
-                before, ss0, after);
+        reg_dump("after ", bar);
+        if (after == ss0)
+            pr_info("turing_write: SS0 write OK (0x%08x -> 0x%08x)\n", before, after);
+        else
+            pr_warn("turing_write: SS0 DROPPED (before=0x%08x wrote=0x%08x readback=0x%08x) — 写保护或 GSP 覆盖\n",
+                    before, ss0, after);
+    }
 
     iounmap(bar);
 out_dis:

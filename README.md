@@ -1,6 +1,6 @@
 # turing-write
 
-最小实验内核模块:对 TU106 Turing GPU(如 NVIDIA CMP40HX,device id 0x1f0b)**只写 SS0 一个寄存器**,测试 "算力解锁是否只需要 SS0=0x88888888" 这一假设。
+最小实验:对 TU106 Turing GPU(如 NVIDIA CMP40HX,device id 0x1f0b)**只写 SS0 一个寄存器**(默认 0x88888888),验证 "算力解锁是否只需要 SS0" 这一假设,并确认它与 vGPU 环境是否兼容。
 
 ## 背景
 
@@ -12,69 +12,79 @@ NVIDIA 40HX 系列解锁项目的源码分析表明:
 | SS1 | 0x40966c | 0x08 | SM_SPEED_SELECT_1 |
 | FECS_PLM | 0x409650 | 0xffffffff | FECS 功能锁打开(是写锁,不是产品身份门) |
 
-而 `turing-unlock` 项目除了写这些寄存器,还做 FLR、SEC2 fire、GSP 重启、WPR2 修改 —— 这些"重"操作被怀疑是它破坏 vGPU 环境的真正原因,而不是寄存器值本身。
+参考项目的关键时序结论:**这些功能寄存器 STICKY,运行时不被 GSP 覆盖,但 GSP 只在 init 时消费一次** —— 所以写入必须发生在 GSP init 之前(参考项目在 UEFI 阶段做)。`turing-unlock` 则在 GSP 起来之后还做 FLR/SEC2 fire/GSP 重启/WPR2 修改,被怀疑是它破坏 vGPU 环境的真正原因。
 
-本模块是**最小化对照实验**:
+本项目的策略:**pre-boot 写入**(initramfs 阶段,nvidia 模块/GSP 之前)写 SS0,重启后一次性验证三件事:
+1. vGPU 是否还活着(vGPU 状态在 boot 时建立,**只有重启后才能判断**)
+2. FP16 吞吐是否提升
+3. 寄存器读回值
 
-- ✅ 唯一硬件写:`BAR0+0x409664` (SS0),默认 0x88888888
-- ❌ 无 FLR / 无 SEC2 fire / 无 GSP 重启 / 无 WPR2 修改 / 不写 PLM/SS1
-- 读 PLM/SS0/SS1 前后值作诊断
+## 文件
 
-## 构建与运行
+| 文件 | 说明 |
+|---|---|
+| `tw_preboot.c` / `tw_preboot` | pre-boot 写入器(静态二进制,可在 kinitramfs 中运行)。/dev/mem 写 SS0,日志同时进控制台和 dmesg(/proc/kmsg)。可选双重 SBR(40HX 完整流程):`/tw_preboot 0x88888888 1` |
+| `install-preboot.sh` | 把 `tw_preboot` 装进当前内核 initramfs,钩子插入 `scripts/local-premount`(root 挂载之前)。自动备份原 initrd 为 `.bak` |
+| `turing_write.c` / `Makefile` | post-boot 校验内核模块:读 PLM/SS0/SS1 当前值(并可选重写 SS0),确认 pre-boot 写入在 GSP init 后是否保持 |
 
-需要当前内核头文件(Debian/Proxmox:`sudo apt install linux-headers-$(uname -r) build-essential`)。
+## 主机操作步骤(Proxmox)
 
 ```bash
+# 1. 拿到文件(git clone 或从别处拷): tw_preboot(二进制) + install-preboot.sh + turing_write.c + Makefile
+cd turing-write
+chmod +x install-preboot.sh
+
+# 2. 构建 post-boot 校验模块(需要内核头文件)
+sudo apt install -y linux-headers-$(uname -r)
 make
-sudo insmod turing_write.ko            # 写 SS0=0x88888888
-dmesg | grep turing_write
+
+# 3. 装入 initramfs(备份自动保留)
+sudo ./install-preboot.sh
+# 想要 40HX 完整流程(双重 SBR + 写 SS0):
+#   sudo SBR=1 ./install-preboot.sh
+
+# 4. 重启(建议开 KVM/串口控制台观察早期启动,能看到 tw_preboot: 行)
+sudo reboot
 ```
 
-写其他值:
+## 重启后检查
 
 ```bash
-sudo rmmod turing_write
-sudo insmod turing_write.ko ss0=0      # 例如写回 0
-```
+# 1. pre-boot 写入日志(来自 /proc/kmsg)
+dmesg | grep tw_preboot
+#   期望: pre : PLM=0xffffff8f SS0=0x00000000 ...
+#         post: SS0=0x88888888 write OK — GSP 将在 init 时消费
 
-## 预期输出
+# 2. GSP init 之后寄存器是否保持(运行时 sticky 校验,只读不写)
+sudo insmod turing_write.ko read_only=1
+dmesg | grep turing_write
+#   before 行若显示 SS0=0x88888888 → 写入穿过 GSP init 存活
 
-```
-turing_write: GPU 0000:01:00.0 dev=0x1f0b
-turing_write before: PLM=0xffffff8f SS0=0x00000000 SS1=0x00000000
-turing_write after : PLM=0xffffff8f SS0=0x88888888 SS1=0x00000000
-turing_write: SS0 write OK (0x00000000 -> 0x88888888)
-```
+# 3. FP16 bench
+./bench_one   # 用你之前的 bench 二进制
 
-`before` 行应为出厂态(PLM=0xffffff8f, SS0=0);若不同,说明之前有解锁残留。
+# 4. vGPU 存活(这才是真正的判断,boot 时建立的)
+nvidia-smi -q | grep -iE -A4 'vgpu|virtualization'
+journalctl -u nvidia-vgpud | tail -30
+# 有 vGPU 实例的话:直接看 VM 能否正常启动/运行
+```
 
 ## 结果判定
 
 | 结果 | 含义 | 下一步 |
 |---|---|---|
-| SS0 写入成功 + vGPU 存活 + FP16 吞吐提升 | 最小写集成立 | 验证重启持久性(参考项目注释:寄存器 STICKY 但 GSP 只在 init 时消费一次,重启后可能需要重写) |
-| SS0 写入成功 + vGPU 存活 + FP16 无变化 | 运行时写被 GSP init 时缓存的判定覆盖 | 改为 initramfs 阶段(GSP init 之前)写入 |
-| SS0 DROPPED(读回值不变) | 运行时写保护 / 被 GSP 拉回 | 同上,必须 pre-boot 写入 |
-| SS0 写入成功 + vGPU 失效 | SS0/SM-speed 域与 vGPU 冲突 | 重启回滚,互斥结论成立 |
-
-vGPU 存活检查:
-
-```bash
-nvidia-smi -q | grep -iE -A4 'vgpu|virtualization'
-journalctl -u nvidia-vgpud --since "5 min ago" | tail -20
-```
+| dmesg write OK + 重启后 SS0 保持 + vGPU 活 + FP16 提升 | **成功**:最小写集成立,且与 vGPU 兼容 | 固化方案(initramfs 钩子已持久;可进一步评估是否写入 SS1 等) |
+| write OK + 重启后 SS0 仍 0x0 | GSP init 时清掉了该寄存器 | 试 `SBR=1`(40HX 完整时序);或 GSP 固件层拒绝,到此为止 |
+| write OK + vGPU 死 | SS0/SM-speed 域与 vGPU 冲突,互斥结论成立 | `sudo ./install-preboot.sh --remove` + 重启回滚 |
+| /dev/mem open/mmap 失败 | STRICT_DEVMEM 或内核配置阻止 | 看错误行;Proxmox 默认 STRICT_DEVMEM=y 但允许 PCI MMIO,若失败需确认 BAR 未被早期占用 |
+| 启动失败/黑屏 | pre-boot 写导致 GSP 起不来 | **再重启一次即恢复出厂**(寄存器每次 boot 按固件配置恢复),然后 `--remove` |
 
 ## 安全性与回滚
 
-- 模块只映射 BAR0 的 `0x409000..0x409FFF` 一页,只写 1 个 32 位寄存器。
-- 不做任何会中断 GPU 的操作(无 FLR/复位),运行中写后 GPU 继续工作。
-- **重启即回滚**:该寄存器在 GSP 初始化时按出厂固件配置恢复(40HX 参考项目:STICKY, not GSP-covered at runtime, consumed ONCE at GSP init)。
-- 若写入后 vGPU 环境异常,直接重启主机即可恢复。
-
-## 文件
-
-- `turing_write.c` — 实验模块源码
-- `Makefile` — 内核模块构建
+- 唯一硬件写:`BAR0+0x409664`,一次 32 位写。默认无 SBR/FLR/复位,不打断 GPU。
+- `install-preboot.sh` 自动备份原 initrd(`/boot/initrd.img-<ver>.bak`);`--remove` 一键还原钩子。
+- **重启即回滚**:该寄存器每次 GSP init 按出厂固件配置恢复。任何异常状态下再重启一次即可。
+- 风险:pre-boot 写入若被 GSP 拒绝,最坏情况是本次 boot GPU 行为异常;不会造成持久损坏。
 
 ## 免责
 
