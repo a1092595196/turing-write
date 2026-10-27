@@ -10,7 +10,8 @@
 #define BOOT0_ARCH_GA10X (0x17U << 24)
 #define BOOT0_IMPL_MASK (0x0fU << 20)
 #define BOOT0_IMPL_GA102 (0x02U << 20)
-#define BOOT0_ARCH_TU10X (0x1aU << 24)   /* Turing family (TU106=40HX) */
+#define BOOT0_ARCH_TU10X (0x1aU << 24)   /* (upstream label) */
+#define BOOT0_ARCH_TU106 (0x16U << 24)   /* Turing family: TU106/CMP40HX BOOT0=0x16xxxxxx */
 #define PCI_COMMAND_OFFSET 0x04U
 #define PCI_COMMAND_MEMORY 0x0002U
 #define PCI_COMMAND_MASTER 0x0004U
@@ -805,6 +806,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE *system_tab
      * readback, otherwise refuse like upstream). */
     if ((boot0 & BOOT0_ARCH_MASK) != BOOT0_ARCH_GA10X &&
         (boot0 & BOOT0_ARCH_MASK) != BOOT0_ARCH_TU10X &&
+        (boot0 & BOOT0_ARCH_MASK) != BOOT0_ARCH_TU106 &&
         (boot0 & 0xff000000U) != 0x0f000000U &&
         boot0 != 0x0fffffffU) {
         console_write("BOOT0 is not GA102/TU106. No register write was attempted.\n");
