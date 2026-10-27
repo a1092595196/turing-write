@@ -61,7 +61,7 @@ static int __init turing_write_init(void)
         return -ENODEV;
     }
     pr_info("turing_write: GPU %04x:%02x:%02x.%x dev=0x%04x\n",
-            gpu->domain, gpu->bus, PCI_SLOT(gpu->devfn), PCI_FUNC(gpu->devfn),
+            pci_domain_nr(gpu->bus), gpu->bus, PCI_SLOT(gpu->devfn), PCI_FUNC(gpu->devfn),
             gpu->device);
 
     if (!pci_resource_start(gpu, 0)) {
