@@ -1,0 +1,6 @@
+turing_write.ko
+turing_write.o
+turing_write.mod
+turing_write.mod.c
+*.deb
+turing-write-build/
