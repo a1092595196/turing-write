@@ -14,9 +14,16 @@
 
 set -e
 VER=$(uname -r)
-IMG=/boot/initrd.img-$VER
 MOD=$(pwd)/turing_write.ko
 
+# 解析实际 initrd 路径:优先 grub.cfg 里当前内核条目的 initrd 行,回退默认路径
+IMG=/boot/initrd.img-$VER
+for gc in /boot/grub/grub.cfg /boot/efi/EFI/*/grub.cfg; do
+    [ -f "$gc" ] || continue
+    p=$(awk -v k="vmlinuz-$VER" 'index($0,k){f=1;next} f && $1=="initrd"{print $2; exit}' "$gc")
+    if [ -n "$p" ] && [ -f "$p" ]; then IMG="$p"; break; fi
+done
+echo "initrd = $IMG"
 [ -f "$IMG" ] || { echo "错误: 找不到 $IMG"; exit 1; }
 
 # 检测压缩格式(gzip/xz/bzip2/zstd/未压缩 newc cpio)
@@ -62,7 +69,19 @@ cp "$MOD" "$TMP/turing_write/turing_write.ko"
 cat > "$TMP/turing_write/load.sh" <<'EOF'
 #!/bin/sh
 # turing_write 早期加载:此刻 nvidia 未加载、GSP 未初始化
+# opt-in(老 turing-unlock 方式):内核命令行必须有 turing_write.targets= 才加载
 [ -d /sys/bus/pci/devices ] || exit 0
+T=""
+for a in $(cat /proc/cmdline); do
+    case "$a" in
+        turing_write.targets=*) T="${a#turing_write.targets=}" ;;
+    esac
+done
+if [ -z "$T" ]; then
+    echo "turing_write-initramfs: 无 turing_write.targets= 参数,跳过"
+    echo '<7>turing_write-initramfs: 无 turing_write.targets= 参数,跳过' >> /proc/kmsg 2>/dev/null
+    exit 0
+fi
 INS=""
 for i in /sbin/insmod /bin/insmod /sbin/modprobe /bin/modprobe; do
     [ -x "$i" ] && INS="$i" && break
@@ -72,9 +91,9 @@ if [ -z "$INS" ]; then
     echo '<7>turing_write-initramfs: 找不到 insmod/modprobe,跳过' >> /proc/kmsg 2>/dev/null
     exit 1
 fi
-if "$INS" /turing_write/turing_write.ko targets=all 2>/dev/null; then
-    echo "turing_write-initramfs: 模块已早期加载 (targets=all)"
-    echo '<7>turing_write-initramfs: 模块已早期加载 (targets=all)' >> /proc/kmsg 2>/dev/null
+if "$INS" /turing_write/turing_write.ko "targets=$T" 2>/dev/null; then
+    echo "turing_write-initramfs: 模块已早期加载 (targets=$T)"
+    echo "<7>turing_write-initramfs: 模块已早期加载 (targets=$T)" >> /proc/kmsg 2>/dev/null
 else
     echo "turing_write-initramfs: 加载失败"
     echo '<7>turing_write-initramfs: 加载失败' >> /proc/kmsg 2>/dev/null

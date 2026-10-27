@@ -15,7 +15,7 @@ set -e
 [ -f turing_write.ko ] || { echo "错误: 先 make 编译出 turing_write.ko"; exit 1; }
 [ -x "$(command -v dpkg-deb)" ] || { echo "错误: 需要 dpkg-deb (Debian/Proxmox 自带)"; exit 1; }
 
-VER=0.2
+VER=0.3
 KVER=$(uname -r)
 T=turing-write-build
 rm -rf "$T"
@@ -31,8 +31,9 @@ Maintainer: a1092595196 <a1092595196@localhost>
 Section: misc
 Priority: optional
 Description: 最小 SS0 pre-boot 写入实验模块 (TU106/CMP40HX)
- 把 turing_write.ko 装入 /lib/modules,并在 initramfs 早期(nvidia/GSP 之前)
- insmod targets=all,实现 GSP init 前的最小 SS0 写入实验。
+ 把 turing_write.ko 装入 /lib/modules,并放入 initramfs(nvidia/GSP 之前加载)。
+ 默认什么都不做;opt-in 方式与 turing-unlock 相同:GRUB 加
+ turing_write.targets=all + update-grub + 重启。
  卸载: apt remove turing-write (自动还原 initramfs 和模块)。
 EOF
 
@@ -40,7 +41,14 @@ cat > "$T/DEBIAN/postinst" <<'POSTINST'
 #!/bin/sh
 # turing-write postinst: 装模块 + initramfs 早期钩子
 KVER=$(uname -r)
+# 解析实际 initrd 路径:优先 grub.cfg 里当前内核条目的 initrd 行,回退默认路径
 IMG=/boot/initrd.img-$KVER
+for gc in /boot/grub/grub.cfg /boot/efi/EFI/*/grub.cfg; do
+    [ -f "$gc" ] || continue
+    p=$(awk -v k="vmlinuz-$KVER" 'index($0,k){f=1;next} f && $1=="initrd"{print $2; exit}' "$gc")
+    if [ -n "$p" ] && [ -f "$p" ]; then IMG="$p"; break; fi
+done
+echo "postinst: initrd = $IMG" >&2
 
 mkdir -p "/lib/modules/$KVER/extra"
 cp -f /usr/share/turing-write/turing_write.ko "/lib/modules/$KVER/extra/"
@@ -63,7 +71,19 @@ if [ -f "$IMG" ]; then
         cat > "$TMP/turing_write/load.sh" <<'LOAD'
 #!/bin/sh
 # turing_write 早期加载:此刻 nvidia 未加载、GSP 未初始化
+# opt-in(老 turing-unlock 方式):内核命令行必须有 turing_write.targets= 才加载
 [ -d /sys/bus/pci/devices ] || exit 0
+T=""
+for a in $(cat /proc/cmdline); do
+    case "$a" in
+        turing_write.targets=*) T="${a#turing_write.targets=}" ;;
+    esac
+done
+if [ -z "$T" ]; then
+    echo "turing_write-initramfs: 无 turing_write.targets= 参数,跳过"
+    echo '<7>turing_write-initramfs: 无 turing_write.targets= 参数,跳过' >> /proc/kmsg 2>/dev/null
+    exit 0
+fi
 INS=""
 for i in /sbin/insmod /bin/insmod /sbin/modprobe /bin/modprobe; do
     [ -x "$i" ] && INS="$i" && break
@@ -73,9 +93,9 @@ if [ -z "$INS" ]; then
     echo '<7>turing_write-initramfs: 找不到 insmod/modprobe,跳过' >> /proc/kmsg 2>/dev/null
     exit 1
 fi
-if "$INS" /turing_write/turing_write.ko targets=all 2>/dev/null; then
-    echo "turing_write-initramfs: 模块已早期加载 (targets=all)"
-    echo '<7>turing_write-initramfs: 模块已早期加载 (targets=all)' >> /proc/kmsg 2>/dev/null
+if "$INS" /turing_write/turing_write.ko "targets=$T" 2>/dev/null; then
+    echo "turing_write-initramfs: 模块已早期加载 (targets=$T)"
+    echo "<7>turing_write-initramfs: 模块已早期加载 (targets=$T)" >> /proc/kmsg 2>/dev/null
 else
     echo "turing_write-initramfs: 加载失败"
     echo '<7>turing_write-initramfs: 加载失败' >> /proc/kmsg 2>/dev/null
@@ -115,6 +135,11 @@ cat > "$T/DEBIAN/postrm" <<'POSTRM'
 # turing-write postrm: 移除 initramfs 钩子 + 清模块
 KVER=$(uname -r)
 IMG=/boot/initrd.img-$KVER
+for gc in /boot/grub/grub.cfg /boot/efi/EFI/*/grub.cfg; do
+    [ -f "$gc" ] || continue
+    p=$(awk -v k="vmlinuz-$KVER" 'index($0,k){f=1;next} f && $1=="initrd"{print $2; exit}' "$gc")
+    if [ -n "$p" ] && [ -f "$p" ]; then IMG="$p"; break; fi
+done
 if [ -f "$IMG" ]; then
     M4=$(head -c4 "$IMG" | od -An -tx1 | tr -d ' \n')
     case "$M4" in

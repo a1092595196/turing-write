@@ -18,13 +18,13 @@ NVIDIA 40HX 系列解锁项目的源码分析表明:
 
 与 turing-unlock 相同的机制,但模块是本项目自己的 `turing_write.ko`(最小路径,无 FLR/fire/GSP 重启/WPR2),打包成 deb,卸载一条命令:
 
-1. 包安装时(postinst):模块装入 `/lib/modules/$(uname -r)/extra/` + depmod,并连同 `load.sh` **拷进 initramfs** 的 `/turing_write/`;
-2. 钩子插入 `scripts/local-premount` —— 在 root 文件系统挂载**之前**、任何 nvidia 模块加载**之前**执行 `insmod ... targets=all`;
-3. 模块此刻读 PLM/SS0/SS1(此时还是 GSP 前的出厂值)→ 写 SS0 → 读回 → 打日志;
-4. 之后 nvidia/GSP 正常初始化,**GSP init 会消费写入值**;
+1. 包安装时(postinst):模块装入 `/lib/modules/$(uname -r)/extra/` + depmod,并连同 `load.sh` **拷进 initramfs** 的 `/turing_write/`(initrd 路径自动从 grub.cfg 解析,压缩格式自动识别);
+2. 钩子插入 initramfs 的早期脚本 —— 在 root 文件系统挂载**之前**、任何 nvidia 模块加载**之前**执行;
+3. **opt-in 与 turing-unlock 完全一致**:GRUB 内核参数 `turing_write.targets=all`。没这个参数 `load.sh` 什么都不做(装了 deb 也是 no-op);
+4. 有参数时,模块读 PLM/SS0/SS1(此时还是 GSP 前的出厂值)→ 写 SS0 → 读回 → 打日志;之后 nvidia/GSP 正常初始化,**GSP init 会消费写入值**;
 5. 重启后一次性验证:vGPU 是否活着、FP16 吞吐、寄存器读回。
 
-模块带 `targets` 参数(与 turing-unlock 一致):`all` 或逗号分隔 PCI 地址,默认 `all`。
+`targets` 取值与 turing-unlock 一致:`all` 或逗号分隔 PCI 地址。
 
 ## 文件
 
@@ -47,29 +47,43 @@ sudo apt install -y linux-headers-$(uname -r)
 make
 ./build-deb.sh
 
-# 3. 安装(原 initrd 自动备份 .bak)
-sudo apt install ./turing-write_0.2_amd64.deb
+# 3. 安装(原 initrd 自动备份 .bak;此时不生效,等 GRUB 参数)
+sudo apt install ./turing-write_0.3_amd64.deb
 dpkg -L turing-write        # 看装了哪些文件
+
+# 4. opt-in:GRUB 加内核参数(老 turing-unlock 方式)
+grep -q 'turing_write.targets' /etc/default/grub || \
+  sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/"$/" turing_write.targets=all"/' /etc/default/grub
+grep GRUB_CMDLINE_LINUX_DEFAULT /etc/default/grub
+sudo update-grub
+
+# 5. 重启
 sudo reboot
 ```
 
-## 卸载(deb 方式,一条命令)
+## 关闭 / 卸载
 
 ```bash
+# 关闭(保留包,下次重启 no-op):
+sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/ turing_write.targets=all//' /etc/default/grub
+sudo update-grub && sudo reboot
+
+# 彻底卸载(还原 initramfs + 模块):
 sudo apt remove turing-write && sudo reboot
 ```
-postrm 自动:还原 initramfs(删 `/turing_write/` 和钩子行)、清 `/lib/modules` 里的模块、depmod。
 
 ## 重启后检查
 
 ```bash
 # 1. 早期加载日志(insmod 由 initramfs 的 load.sh 发起,早于 nvidia)
 dmesg | grep turing_write
-#   期望顺序:
+#   GRUB 有参数时,期望顺序:
 #     turing_write-initramfs: 模块已早期加载 (targets=all)
 #     turing_write: GPU xxxx:xx:00.0 dev=0x1f0b targets=all
 #     turing_write before: PLM=0xffffff8f SS0=0x00000000 SS1=0x00000000   ← GSP 前的出厂值
 #     turing_write post : PLM=0xffffff8f SS0=0x88888888 SS1=0x00000000 write OK
+#   没加 GRUB 参数时只有一行(证明钩子在、参数没开):
+#     turing_write-initramfs: 无 turing_write.targets= 参数,跳过
 
 # 2. GSP init 之后寄存器是否保持(运行时 sticky 校验,只读不写)
 sudo insmod /lib/modules/$(uname -r)/extra/turing_write.ko read_only=1
