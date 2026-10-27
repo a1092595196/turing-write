@@ -58,8 +58,9 @@ sudo sh efi/install-efi.sh
 
 脚本做三件事:
 1. 三个 .efi → `/boot/efi/EFI/UNLOCK/`
-2. 生成 `/etc/grub.d/40-cmp40hx`(自动从 grub.cfg 抽取 PVE 原条目),新增两个菜单项:
-   - `PVE + CMP40HX UNLOCK (compute, ...)` ← 先选这个
+2. 生成 `/etc/grub.d/40-cmp40hx`(自动从 grub.cfg 抽取 PVE 原条目),新增三个菜单项:
+   - `PVE + CMP40HX UNLOCK (inspect, ...)` ← 第一次先选这个:只读,零风险
+   - `PVE + CMP40HX UNLOCK (compute, ...)` ← 确认链路 OK 后选这个
    - `PVE + CMP40HX UNLOCK (full, ...)`
    每个条目 = `search` 找 ESP → `exec /EFI/UNLOCK/NVPermissiveEFI-*.efi` → 恢复 root → 原样启 PVE
 3. `update-grub`
