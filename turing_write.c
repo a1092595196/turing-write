@@ -10,6 +10,7 @@
  *   sudo insmod turing_write.ko read_only=1   # post-boot 校验:只读,不写
  *   sudo insmod turing_write.ko               # 写 SS0=0x88888888
  *   sudo insmod turing_write.ko ss0=0         # 写别的值(如重新锁回 0)
+ *   sudo insmod turing_write.ko targets=all   # 老 turing-unlock 式 opt-in(默认就是 all)
  *   dmesg | grep turing_write
  *   sudo rmmod turing_write
  */
@@ -32,6 +33,24 @@ MODULE_PARM_DESC(ss0, "value to write to SS0 (BAR0+0x409664), default 0x88888888
 static u32 read_only;
 module_param(read_only, uint, 0444);
 MODULE_PARM_DESC(read_only, "1 = read-only dump, no hardware write (post-boot verification)");
+
+/* "all" 或逗号分隔的 PCI 地址(与 turing-unlock 的 targets 参数一致),默认 all */
+static char *targets = "all";
+module_param(targets, charp, 0444);
+MODULE_PARM_DESC(targets, "\"all\" or comma-separated PCI addresses, default all");
+
+static bool listed(const char *name)
+{
+    const char *entry, *end;
+
+    for (entry = targets; *entry; entry = *end ? end + 1 : end) {
+        end = strchrnul(entry, ',');
+        if (strlen(name) == (size_t)(end - entry) &&
+            !strncasecmp(name, entry, end - entry))
+            return true;
+    }
+    return false;
+}
 
 /* 只读参考寄存器 (BAR0 偏移) */
 #define REG_PLM  0x00409650u
@@ -60,9 +79,18 @@ static int __init turing_write_init(void)
         pr_err("turing_write: no NVIDIA GPU found\n");
         return -ENODEV;
     }
-    pr_info("turing_write: GPU %04x:%02x:%02x.%x dev=0x%04x\n",
-            pci_domain_nr(gpu->bus), gpu->bus, PCI_SLOT(gpu->devfn), PCI_FUNC(gpu->devfn),
-            gpu->device);
+    {
+        char name[32];
+        snprintf(name, sizeof name, "%04x:%02x:%02x.%x",
+                 pci_domain_nr(gpu->bus), gpu->bus, PCI_SLOT(gpu->devfn), PCI_FUNC(gpu->devfn));
+        pr_info("turing_write: GPU %s dev=0x%04x targets=%s\n",
+                name, gpu->device, targets);
+        if (strcmp(targets, "all") && !listed(name)) {
+            pr_info("turing_write: %s 不在 targets 列表,跳过\n", name);
+            pci_dev_put(gpu);
+            return 0;
+        }
+    }
 
     if (!pci_resource_start(gpu, 0)) {
         pr_err("turing_write: BAR0 not present\n");

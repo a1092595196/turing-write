@@ -14,56 +14,64 @@ NVIDIA 40HX 系列解锁项目的源码分析表明:
 
 参考项目的关键时序结论:**这些功能寄存器 STICKY,运行时不被 GSP 覆盖,但 GSP 只在 init 时消费一次** —— 所以写入必须发生在 GSP init 之前(参考项目在 UEFI 阶段做)。`turing-unlock` 则在 GSP 起来之后还做 FLR/SEC2 fire/GSP 重启/WPR2 修改,被怀疑是它破坏 vGPU 环境的真正原因。
 
-本项目的策略:**pre-boot 写入**(initramfs 阶段,nvidia 模块/GSP 之前)写 SS0,重启后一次性验证三件事:
-1. vGPU 是否还活着(vGPU 状态在 boot 时建立,**只有重启后才能判断**)
-2. FP16 吞吐是否提升
-3. 寄存器读回值
+## 方案:老方式 —— 内核模块进 initramfs + `targets=all` opt-in
+
+与 turing-unlock 相同的机制,但模块是本项目自己的 `turing_write.ko`(最小路径,无 FLR/fire/GSP 重启/WPR2):
+
+1. 模块编译进系统,`install-module.sh` 把它**拷进 initramfs** 的 `/turing_write/`;
+2. 钩子插入 `scripts/local-premount` —— 在 root 文件系统挂载**之前**、任何 nvidia 模块加载**之前**执行 `insmod ... targets=all`;
+3. 模块此刻读 PLM/SS0/SS1(此时还是 GSP 前的出厂值)→ 写 SS0 → 读回 → 打日志;
+4. 之后 nvidia/GSP 正常初始化,**GSP init 会消费写入值**;
+5. 重启后一次性验证:vGPU 是否活着、FP16 吞吐、寄存器读回。
+
+模块带 `targets` 参数(与 turing-unlock 一致):`all` 或逗号分隔 PCI 地址,默认 `all`。
 
 ## 文件
 
 | 文件 | 说明 |
 |---|---|
-| `tw_preboot.c` / `tw_preboot` | pre-boot 写入器(静态二进制,可在 kinitramfs 中运行)。/dev/mem 写 SS0,日志同时进控制台和 dmesg(/proc/kmsg)。可选双重 SBR(40HX 完整流程):`/tw_preboot 0x88888888 1` |
-| `install-preboot.sh` | 把 `tw_preboot` 装进当前内核 initramfs,钩子插入 `scripts/local-premount`(root 挂载之前)。自动备份原 initrd 为 `.bak` |
-| `turing_write.c` / `Makefile` | post-boot 校验内核模块:读 PLM/SS0/SS1 当前值(并可选重写 SS0),确认 pre-boot 写入在 GSP init 后是否保持 |
+| `turing_write.c` / `Makefile` | 实验内核模块:早期写 SS0(带 `targets` opt-in),或 `read_only=1` 只读校验 |
+| `install-module.sh` | 装模块:`/lib/modules/$(uname -r)/extra/` + depmod,并连同 `load.sh` 拷进 initramfs(自动识别 initrd 压缩格式: gzip/xz/bzip2/zstd/未压缩 cpio),钩子插入 `local-premount`,原 initrd 备份为 `.bak` |
+| `tw_preboot.c` / `tw_preboot` | 备选:pre-boot 写入器静态二进制(/dev/mem 方式),`install-preboot.sh` 安装 |
 
 ## 主机操作步骤(Proxmox)
 
 ```bash
-# 1. 拿到文件(git clone 或从别处拷): tw_preboot(二进制) + install-preboot.sh + turing_write.c + Makefile
+# 1. 拿到代码
+git clone https://github.com/a1092595196/turing-write.git   # 或走 ghfast.top 镜像
 cd turing-write
-chmod +x install-preboot.sh
 
-# 2. 构建 post-boot 校验模块(需要内核头文件)
+# 2. 编译模块
 sudo apt install -y linux-headers-$(uname -r)
 make
 
-# 3. 装入 initramfs(备份自动保留)
-sudo ./install-preboot.sh
-# 想要 40HX 完整流程(双重 SBR + 写 SS0):
-#   sudo SBR=1 ./install-preboot.sh
+# 3. 装入 initramfs(原文件自动备份 .bak)
+sudo ./install-module.sh
 
-# 4. 重启(建议开 KVM/串口控制台观察早期启动,能看到 tw_preboot: 行)
+# 4. 重启
 sudo reboot
 ```
 
 ## 重启后检查
 
 ```bash
-# 1. pre-boot 写入日志(来自 /proc/kmsg)
-dmesg | grep tw_preboot
-#   期望: pre : PLM=0xffffff8f SS0=0x00000000 ...
-#         post: SS0=0x88888888 write OK — GSP 将在 init 时消费
+# 1. 早期加载日志(insmod 由 initramfs 的 load.sh 发起,早于 nvidia)
+dmesg | grep turing_write
+#   期望顺序:
+#     turing_write-initramfs: 模块已早期加载 (targets=all)
+#     turing_write: GPU xxxx:xx:00.0 dev=0x1f0b targets=all
+#     turing_write before: PLM=0xffffff8f SS0=0x00000000 SS1=0x00000000   ← GSP 前的出厂值
+#     turing_write post : PLM=0xffffff8f SS0=0x88888888 SS1=0x00000000 write OK
 
 # 2. GSP init 之后寄存器是否保持(运行时 sticky 校验,只读不写)
-sudo insmod turing_write.ko read_only=1
-dmesg | grep turing_write
+sudo insmod /lib/modules/$(uname -r)/extra/turing_write.ko read_only=1
+dmesg | grep turing_write | tail -3
 #   before 行若显示 SS0=0x88888888 → 写入穿过 GSP init 存活
 
 # 3. FP16 bench
-./bench_one   # 用你之前的 bench 二进制
+./bench_one
 
-# 4. vGPU 存活(这才是真正的判断,boot 时建立的)
+# 4. vGPU 存活(真正的判断,boot 时建立的)
 nvidia-smi -q | grep -iE -A4 'vgpu|virtualization'
 journalctl -u nvidia-vgpud | tail -30
 # 有 vGPU 实例的话:直接看 VM 能否正常启动/运行
@@ -73,42 +81,16 @@ journalctl -u nvidia-vgpud | tail -30
 
 | 结果 | 含义 | 下一步 |
 |---|---|---|
-| dmesg write OK + 重启后 SS0 保持 + vGPU 活 + FP16 提升 | **成功**:最小写集成立,且与 vGPU 兼容 | 固化方案(initramfs 钩子已持久;可进一步评估是否写入 SS1 等) |
-| write OK + 重启后 SS0 仍 0x0 | GSP init 时清掉了该寄存器 | 试 `SBR=1`(40HX 完整时序);或 GSP 固件层拒绝,到此为止 |
-| write OK + vGPU 死 | SS0/SM-speed 域与 vGPU 冲突,互斥结论成立 | `sudo ./install-preboot.sh --remove` + 重启回滚 |
-| /dev/mem open/mmap 失败 | STRICT_DEVMEM 或内核配置阻止 | 看错误行;Proxmox 默认 STRICT_DEVMEM=y 但允许 PCI MMIO,若失败需确认 BAR 未被早期占用 |
-| 启动失败/黑屏 | pre-boot 写导致 GSP 起不来 | **再重启一次即恢复出厂**(寄存器每次 boot 按固件配置恢复),然后 `--remove` |
-
-## 对比实验:老 turing-unlock 全路径(GRUB 参数,不动 initramfs)
-
-如果主机上还装着 turing-unlock 的模块和固件(之前回滚时可能只去掉了内核参数),可以直接用老方式跑一次"全路径"对照实验(FLR + SEC2 fire + GSP 重启 + WPR2 修改):
-
-```bash
-# 先确认模块还在
-modinfo turing_unlock | head
-cpio -t < /boot/initrd.img-$(uname -r) | grep -i turing   # 本机 initrd 是未压缩 newc cpio,直接 cpio -t
-
-# 加内核参数(唯一 opt-in,模块没参数时什么都不做)
-grep -q 'turing_unlock.targets' /etc/default/grub || \
-  sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/"$/" turing_unlock.targets=all"/' /etc/default/grub
-grep GRUB_CMDLINE_LINUX_DEFAULT /etc/default/grub
-sudo update-grub && sudo reboot
-```
-
-重启后检查:`journalctl -k -b | grep turing_unlock`、vGPU 状态、`./bench_one`。
-回滚:把参数删掉再 update-grub + 重启即可:
-
-```bash
-sudo sed -i '/^GRUB_CMDLINE_LINUX_DEFAULT=/s/ turing_unlock.targets=all//' /etc/default/grub
-sudo update-grub && sudo reboot
-```
-
-注意:这是之前被怀疑破坏 vGPU 的那条重路径,本次重启实验的目的就是在 reboot 级别验证互斥结论;若 GPU 起不来,删参数重启即恢复。
+| 早期 write OK + 重启后 SS0 保持 + vGPU 活 + FP16 提升 | **成功**:最小写集成立,且与 vGPU 兼容 | 固化(initramfs 钩子已持久;可进一步评估 SS1) |
+| write OK + 重启后 SS0 仍 0x0 | GSP init 时清掉了该寄存器 | 试 40HX 完整时序(SBR 变体);或 GSP 固件层拒绝,到此为止 |
+| write OK + vGPU 死 | SS0/SM-speed 域与 vGPU 冲突,互斥结论成立 | `sudo ./install-module.sh --remove` + 重启回滚 |
+| initramfs 里 insmod 失败(日志有 "加载失败") | klibc insmod 兼容性问题 | 看具体报错;备选 `tw_preboot` 静态二进制路线 |
+| 启动失败/黑屏 | pre-boot 写导致 GSP 起不来 | **再重启一次即恢复出厂**,然后 `sudo ./install-module.sh --remove` |
 
 ## 安全性与回滚
 
-- 唯一硬件写:`BAR0+0x409664`,一次 32 位写。默认无 SBR/FLR/复位,不打断 GPU。
-- `install-preboot.sh` 自动备份原 initrd(`/boot/initrd.img-<ver>.bak`);`--remove` 一键还原钩子。
+- 唯一硬件写:`BAR0+0x409664`,一次 32 位写。无 SBR/FLR/复位,不打断 GPU。
+- `install-module.sh` 自动备份原 initrd(`/boot/initrd.img-<ver>.bak`);`--remove` 一键还原(同时清掉 `/lib/modules` 里的模块并 depmod)。
 - **重启即回滚**:该寄存器每次 GSP init 按出厂固件配置恢复。任何异常状态下再重启一次即可。
 - 风险:pre-boot 写入若被 GSP 拒绝,最坏情况是本次 boot GPU 行为异常;不会造成持久损坏。
 
